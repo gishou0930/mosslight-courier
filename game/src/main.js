@@ -1,32 +1,48 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+import { POLLEN_GOAL, STEP } from './config.js';
+import { createInput } from './input.js';
+import { createRenderer } from './render.js';
+import { createWorld, stepWorld } from './world.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+const canvas = document.querySelector('#game');
+const statusLine = document.querySelector('#status');
+const hud = document.querySelector('#hud');
+const veil = document.querySelector('#veil');
+const dialogKicker = document.querySelector('#dialog-kicker');
+const dialogTitle = document.querySelector('#dialog-title');
+const dialogCopy = document.querySelector('#dialog-copy');
+const dialogNote = document.querySelector('#dialog-note');
+const startButton = document.querySelector('#start-button');
+const pauseButton = document.querySelector('#pause-button');
+const goalRibbon = document.querySelector('#goal-ribbon');
+const goalNote = document.querySelector('#goal-note');
+const bestLabel = document.querySelector('#best-score');
+const pollenLabel = document.querySelector('#pollen-count');
+const scoreLabel = document.querySelector('#flight-score');
+const timeLabel = document.querySelector('#time-left');
+const livesLabel = document.querySelector('#lives');
+const pollenPips = [...document.querySelectorAll('#pollen-pips i')];
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const seedValue = Number.parseInt(new URLSearchParams(window.location.search).get('seed') ?? '', 10);
+const seed = Number.isInteger(seedValue) ? seedValue : 41;
+const renderer = createRenderer(canvas, seed);
+const input = createInput();
+const bestKey = 'mosslight-courier-best';
+let world = createWorld();
+let screen = 'title';
+let best = readBest();
+let accumulator = 0;
+let visualTime = 0;
+let lastFrame = performance.now();
+let lastPollenCount = -1;
+let lastHealth = -1;
 
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+function setText(element, value) {
+  if (element.textContent !== value) element.textContent = value;
+}
 
 function readBest() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+    return Number.parseInt(window.localStorage.getItem(bestKey) ?? '0', 10) || 0;
   } catch {
     return 0;
   }
@@ -34,101 +50,179 @@ function readBest() {
 
 function saveBest(value) {
   try {
-    window.localStorage.setItem(BEST_KEY, String(value));
+    window.localStorage.setItem(bestKey, String(value));
   } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+    // The current visit still shows the new record when browser storage is disabled.
   }
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+function updateHud() {
+  setText(pollenLabel, String(world.pollenCount));
+  setText(scoreLabel, String(world.score).padStart(4, '0'));
+  setText(timeLabel, String(Math.ceil(world.timeLeft)).padStart(2, '0'));
+  setText(bestLabel, String(best).padStart(4, '0'));
+  if (lastHealth !== world.health) {
+    livesLabel.replaceChildren(...Array.from({ length: 3 }, (_, index) => {
+      const mark = document.createElement('span');
+      mark.textContent = '✦';
+      mark.className = index < world.health ? 'life-on' : 'life-off';
+      return mark;
+    }));
+    lastHealth = world.health;
   }
-  requestAnimationFrame(paint);
+  if (lastPollenCount !== world.pollenCount) {
+    for (const [index, pip] of pollenPips.entries()) {
+      pip.classList.toggle('filled', index < world.pollenCount);
+    }
+    lastPollenCount = world.pollenCount;
+  }
+  const ready = world.pollenCount >= POLLEN_GOAL;
+  setText(goalRibbon, ready ? 'MOON BLOOM OPEN · FLY EAST' : 'GATHER 6 · FOLLOW THE GOLDEN THREAD');
+  setText(goalNote, ready
+    ? 'The moon bloom is awake. Bring the seed to its heart.'
+    : 'Six pollen lights open the moon bloom.');
+  goalRibbon.hidden = screen !== 'playing' && screen !== 'paused';
+  pauseButton.hidden = screen !== 'playing';
+  hud.hidden = screen === 'title';
 }
 
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
+function showOverlay(kicker, title, copy, buttonText, note) {
+  dialogKicker.textContent = kicker;
+  dialogTitle.innerHTML = title;
+  dialogCopy.textContent = copy;
+  startButton.innerHTML = buttonText + ' <span aria-hidden="true">↗</span>';
+  dialogNote.textContent = note;
+  veil.hidden = false;
+  pauseButton.hidden = true;
+}
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
+function beginFlight() {
+  world = createWorld();
+  world.mode = 'playing';
+  screen = 'playing';
+  accumulator = 0;
+  veil.hidden = true;
+  hud.hidden = false;
+  pauseButton.hidden = false;
+  updateHud();
+  statusLine.textContent = 'Flight started. Gather six pollen lights, avoid thorn sprites, then reach the moon bloom.';
+  canvas.focus({ preventScroll: true });
+}
+
+function finishFlight(result) {
+  screen = result;
+  accumulator = 0;
+  if (world.score > best) {
+    best = world.score;
+    saveBest(best);
   }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+  updateHud();
+  if (result === 'won') {
+    showOverlay(
+      'DELIVERY COMPLETE',
+      'The garden<br><em>remembers you.</em>',
+      'The moonseed is home. Your careful flight scored ' + world.score + ' points.',
+      'Fly again',
+      'ENTER or SPACE to start a new delivery',
+    );
+    statusLine.textContent = 'You delivered the moonseed. Final score ' + world.score + '. Press Enter or Space to fly again.';
+  } else {
+    const reason = world.health <= 0 ? 'The thorn sprites clipped your wings.' : 'Dawn reached the garden before the delivery.';
+    showOverlay(
+      'FLIGHT ENDED',
+      'The night<br><em>slips away.</em>',
+      reason + ' You gathered ' + world.pollenCount + ' of 6 pollen lights and scored ' + world.score + ' points.',
+      'Try another flight',
+      'ENTER or SPACE to try again',
+    );
+    statusLine.textContent = 'Flight ended. Score ' + world.score + '. Press Enter or Space to try again.';
   }
+}
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
+function pauseFlight() {
+  if (screen !== 'playing') return;
+  screen = 'paused';
+  accumulator = 0;
+  showOverlay(
+    'QUIET MOMENT',
+    'Rest your<br><em>wings.</em>',
+    'Your pollen and time are safe. Resume when you are ready.',
+    'Resume flight',
+    'P or ESC to resume',
+  );
+  statusLine.textContent = 'Flight paused. Press P, Escape or the button to resume.';
+}
+
+function resumeFlight() {
+  if (screen !== 'paused') return;
+  screen = 'playing';
+  veil.hidden = true;
+  pauseButton.hidden = false;
+  canvas.focus({ preventScroll: true });
+  statusLine.textContent = 'Flight resumed.';
+}
+
+function reportEvents(events) {
+  for (const event of events) {
+    if (event.type === 'pollen') {
+      const chainText = event.chain > 1 ? ' Chain ' + event.chain + ' for ' + event.gained + ' points.' : ' +' + event.gained + ' points.';
+      statusLine.textContent = 'Pollen ' + event.count + ' of 6.' + chainText;
+    } else if (event.type === 'hurt') {
+      statusLine.textContent = event.health > 0 ? 'A thorn sprite caught you. ' + event.health + ' wingbeats remain.' : 'Your last wingbeat is gone.';
+    } else if (event.type === 'dash') {
+      statusLine.textContent = 'Dash used. Recharge takes just over two seconds.';
+    } else if (event.type === 'won') {
+      finishFlight('won');
+    } else if (event.type === 'lost') {
+      finishFlight('lost');
     }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
   }
+}
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
-  }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+function frame(now) {
   requestAnimationFrame(frame);
+  const elapsed = Math.min((now - lastFrame) / 1000, .25);
+  lastFrame = now;
+  visualTime += elapsed;
+  const controls = input.read();
+
+  if (screen === 'title' && controls.confirmPressed) beginFlight();
+  else if (screen === 'paused' && (controls.pausePressed || controls.confirmPressed)) resumeFlight();
+  else if (screen === 'playing' && controls.pausePressed) pauseFlight();
+
+  if (screen === 'playing') {
+    accumulator += elapsed;
+    while (accumulator >= STEP && screen === 'playing') {
+      reportEvents(stepWorld(world, controls, STEP));
+      accumulator -= STEP;
+    }
+    updateHud();
+  } else if (screen === 'title' || screen === 'paused') {
+    world.player.trail.length = 0;
+  }
+
+  renderer.draw(world, visualTime);
 }
 
-if (shot) runShot(shot);
-else runGame();
+startButton.addEventListener('click', () => {
+  if (screen === 'paused') resumeFlight();
+  else beginFlight();
+});
+pauseButton.addEventListener('click', pauseFlight);
+canvas.addEventListener('click', () => {
+  if (screen === 'title') beginFlight();
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) pauseFlight();
+});
+
+showOverlay(
+  'A SMALL LIGHT IN THE DARK',
+  'Bring the<br><em>moonseed home.</em>',
+  'Slip through the moss, gather six drifting pollen lights, and wake the moon bloom. Thorn sprites sting; three wingbeats are all you have.',
+  'Begin the flight',
+  'WASD / ARROWS to glide · SPACE to dash',
+);
+bestLabel.textContent = String(best).padStart(4, '0');
+updateHud();
+requestAnimationFrame(frame);

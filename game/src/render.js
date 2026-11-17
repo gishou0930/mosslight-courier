@@ -1,141 +1,301 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720 playfield
-// is scaled to fit the window and centred, the margin filled with the backdrop colour. Flat
-// rectangles and circles, canvas text for the HUD and the panels. Text that holds a number is
-// rebuilt only when the number changes, so a frame allocates nothing.
-import { FIELD, FONT, LIVES, PALETTE } from './config.js';
-import { KIND_COIN } from './world.js';
+import { HEIGHT, MOON_BLOOM, POLLEN_GOAL, WIDTH } from './config.js';
+import { createRandom } from './random.js';
 
-export const SCREEN_TITLE = 'title';
-export const SCREEN_PLAY = 'play';
-export const SCREEN_PAUSED = 'paused';
-export const SCREEN_OVER = 'over';
+function drawBackground(ctx, stars, time) {
+  const night = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+  night.addColorStop(0, '#0b1d22');
+  night.addColorStop(.54, '#102b2a');
+  night.addColorStop(1, '#132c28');
+  ctx.fillStyle = night;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-/** The panel's width; its height grows with its lines: room for the title, the lines and the prompt. */
-const PANEL = { width: 600, top: 134, line: 34, bottom: 70 };
-const LIFE_SIZE = 20;
-const LIFE_GAP = 8;
+  const clearing = ctx.createRadialGradient(482, 296, 52, 482, 296, 505);
+  clearing.addColorStop(0, 'rgba(44, 96, 70, .35)');
+  clearing.addColorStop(.66, 'rgba(24, 64, 54, .17)');
+  clearing.addColorStop(1, 'rgba(7, 21, 25, .5)');
+  ctx.fillStyle = clearing;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+  for (const star of stars) {
+    const twinkle = .24 + (Math.sin(time * .8 + star.phase) + 1) * .16;
+    ctx.globalAlpha = twinkle;
+    ctx.fillStyle = star.warm ? '#f3db9d' : '#c8e9cf';
+    ctx.beginPath();
+    ctx.arc(star.x, star.y, star.radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(137, 190, 142, .065)';
+  ctx.lineWidth = 1;
+  for (let row = 0; row < 7; row += 1) {
+    const y = 104 + row * 65;
+    ctx.beginPath();
+    ctx.moveTo(0, y + Math.sin(row) * 18);
+    ctx.bezierCurveTo(180, y - 40, 280, y + 48, 478, y + 8);
+    ctx.bezierCurveTo(660, y - 24, 810, y + 43, WIDTH, y - 12);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  drawEdgeLeaves(ctx);
+  const haze = ctx.createRadialGradient(489, 306, 120, 490, 300, 455);
+  haze.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  haze.addColorStop(1, 'rgba(2, 10, 14, .3)');
+  ctx.fillStyle = haze;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
 }
 
-export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const levelLabel = cachedLabel('Level ');
-  const finalLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
-
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
+function drawEdgeLeaves(ctx) {
+  ctx.save();
+  ctx.lineCap = 'round';
+  for (let side = 0; side < 2; side += 1) {
+    ctx.save();
+    if (side === 1) {
+      ctx.translate(WIDTH, HEIGHT);
+      ctx.rotate(Math.PI);
+    }
+    ctx.strokeStyle = 'rgba(78, 139, 93, .3)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-12, 575);
+    ctx.bezierCurveTo(78, 474, 18, 348, 91, 250);
+    ctx.bezierCurveTo(135, 189, 86, 85, 164, 15);
+    ctx.stroke();
+    for (let index = 0; index < 9; index += 1) {
+      const x = 25 + (index % 3) * 24;
+      const y = 522 - index * 57;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(-.58 + index * .12);
+      ctx.fillStyle = 'rgba(88, 151, 99, ' + (.2 + (index % 3) * .035) + ')';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 22, 8, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(165, 207, 143, .16)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(-15, 0);
+      ctx.lineTo(15, 0);
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.restore();
   }
+  ctx.restore();
+}
 
-  const fonts = new Map();
-  function text(value, x, y, size, color, align) {
-    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
-    context.font = fonts.get(size);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
+function drawThread(ctx, open) {
+  ctx.save();
+  ctx.setLineDash([3, 10]);
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = open ? 'rgba(243, 213, 144, .35)' : 'rgba(193, 207, 151, .12)';
+  ctx.beginPath();
+  ctx.moveTo(119, 300);
+  ctx.bezierCurveTo(333, 262, 470, 345, 648, 288);
+  ctx.bezierCurveTo(744, 257, 809, 285, MOON_BLOOM.x, MOON_BLOOM.y);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function drawPollen(ctx, bloom, time) {
+  if (bloom.taken) return;
+  const float = Math.sin(time * 2 + bloom.index * 1.7) * 3;
+  ctx.save();
+  ctx.translate(bloom.x, bloom.y + float);
+  ctx.globalAlpha = .22;
+  ctx.fillStyle = '#ffe9a8';
+  ctx.beginPath();
+  ctx.arc(0, 0, 20 + Math.sin(time * 2.4 + bloom.index) * 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  for (let petal = 0; petal < 5; petal += 1) {
+    ctx.save();
+    ctx.rotate((Math.PI * 2 * petal) / 5 + time * .12);
+    ctx.fillStyle = 'rgba(255, 222, 140, .87)';
+    ctx.beginPath();
+    ctx.ellipse(0, -7, 3.1, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
   }
+  ctx.fillStyle = '#fff1bb';
+  ctx.shadowColor = '#ffd978';
+  ctx.shadowBlur = 12;
+  ctx.beginPath();
+  ctx.arc(0, 0, 3.1, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
 
-  function drawField(state) {
-    context.fillStyle = PALETTE.sky;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.fillStyle = PALETTE.ground;
-    context.fillRect(0, FIELD.groundY, FIELD.width, FIELD.height - FIELD.groundY);
+function drawMoonBloom(ctx, open, time) {
+  const pulse = Math.sin(time * 1.6) * 2;
+  ctx.save();
+  ctx.translate(MOON_BLOOM.x, MOON_BLOOM.y);
+  ctx.globalAlpha = open ? .3 : .12;
+  ctx.fillStyle = open ? '#ffe49e' : '#9ebc91';
+  ctx.beginPath();
+  ctx.arc(0, 0, open ? 47 + pulse : 38, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = open ? 1 : .55;
+  for (let petal = 0; petal < 12; petal += 1) {
+    ctx.save();
+    ctx.rotate((Math.PI * 2 * petal) / 12 + time * .08);
+    ctx.fillStyle = open ? '#f7d88e' : '#a5c28f';
+    ctx.beginPath();
+    ctx.ellipse(0, -19 - pulse * .3, 8, 17, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = open ? '#fff0bb' : '#d3dfae';
+  ctx.shadowColor = open ? '#ffe99d' : '#b6d9a1';
+  ctx.shadowBlur = open ? 19 : 9;
+  ctx.beginPath();
+  ctx.arc(0, 0, 10 + pulse * .2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = open ? 'rgba(255, 239, 177, .8)' : 'rgba(204, 220, 175, .4)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(0, 0, 31 + pulse, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
 
-    const items = state.items;
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      if (item.kind === KIND_COIN) {
-        context.fillStyle = PALETTE.coin;
-        context.beginPath();
-        context.arc(item.x + item.width / 2, item.y + item.height / 2, item.width / 2, 0, Math.PI * 2);
-        context.fill();
-      } else {
-        context.fillStyle = PALETTE.block;
-        context.fillRect(item.x, item.y, item.width, item.height);
+function drawThorn(ctx, thorn, time) {
+  const throb = Math.sin(time * 4 + thorn.index) * 2;
+  ctx.save();
+  ctx.translate(thorn.px, thorn.py);
+  ctx.rotate(time * (thorn.index % 2 ? -.42 : .34) + thorn.index);
+  ctx.strokeStyle = 'rgba(246, 151, 157, .31)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(0, 0, thorn.radius + 9 + throb, 0, Math.PI * 2);
+  ctx.stroke();
+  for (let point = 0; point < 8; point += 1) {
+    ctx.save();
+    ctx.rotate((Math.PI * 2 * point) / 8);
+    ctx.fillStyle = point % 2 ? '#682f48' : '#8a4052';
+    ctx.beginPath();
+    ctx.moveTo(-5, -6);
+    ctx.lineTo(-3, -thorn.radius - 10);
+    ctx.lineTo(3, -thorn.radius - 15);
+    ctx.lineTo(6, -6);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+  const core = ctx.createRadialGradient(-5, -6, 1, 0, 0, thorn.radius + 2);
+  core.addColorStop(0, '#d77c87');
+  core.addColorStop(.5, '#9d4c63');
+  core.addColorStop(1, '#4b2a43');
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.arc(0, 0, thorn.radius + throb * .4, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255, 204, 173, .9)';
+  ctx.beginPath();
+  ctx.arc(-4, -4, 2.2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawMoth(ctx, player, time) {
+  for (let index = player.trail.length - 1; index >= 0; index -= 2) {
+    const point = player.trail[index];
+    const alpha = .13 * (1 - index / player.trail.length);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#b9ed9a';
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, 2 + (1 - index / player.trail.length) * 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (player.invulnerable > 0 && Math.floor(time * 15) % 2 === 0) return;
+
+  const flap = Math.sin(time * 18) * .42;
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  ctx.rotate(player.facing);
+  ctx.shadowColor = '#c8f3a3';
+  ctx.shadowBlur = player.dashTimer > 0 ? 24 : 14;
+
+  ctx.globalAlpha = .82;
+  ctx.fillStyle = '#c5e9c5';
+  ctx.beginPath();
+  ctx.ellipse(-2, -8, 10, 6 + flap * 3, -.25, 0, Math.PI * 2);
+  ctx.ellipse(-2, 8, 10, 6 - flap * 3, .25, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#d6d68c';
+  ctx.beginPath();
+  ctx.ellipse(2, 0, 10, 4.4, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#f5edc0';
+  ctx.beginPath();
+  ctx.arc(9, 0, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = 'rgba(242, 235, 191, .8)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(10, -2);
+  ctx.quadraticCurveTo(15, -10, 19, -8);
+  ctx.moveTo(10, 2);
+  ctx.quadraticCurveTo(15, 10, 19, 8);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawMotes(ctx, motes) {
+  for (const mote of motes) {
+    ctx.globalAlpha = Math.max(0, mote.life / mote.maxLife);
+    ctx.fillStyle = mote.color;
+    ctx.beginPath();
+    ctx.arc(mote.x, mote.y, 2.4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+export function createRenderer(canvas, seed = 1) {
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const random = createRandom(seed);
+  const stars = Array.from({ length: 108 }, () => ({
+    x: random() * WIDTH,
+    y: random() * HEIGHT,
+    radius: .35 + random() * 1.1,
+    phase: random() * Math.PI * 2,
+    warm: random() > .72,
+  }));
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = WIDTH * ratio;
+  canvas.height = HEIGHT * ratio;
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+  return {
+    draw(world, visualTime) {
+      const time = reducedMotion ? 0 : visualTime;
+      drawBackground(ctx, stars, time);
+      drawThread(ctx, world.pollenCount >= POLLEN_GOAL);
+      drawMoonBloom(ctx, world.pollenCount >= POLLEN_GOAL, time);
+      for (const bloom of world.pollen) drawPollen(ctx, bloom, time);
+      for (const thorn of world.thorns) drawThorn(ctx, thorn, time);
+      drawMotes(ctx, world.motes);
+      drawMoth(ctx, world.player, time);
+      if (world.mode === 'ready') {
+        ctx.globalAlpha = .5;
+        ctx.fillStyle = '#fff1bf';
+        ctx.beginPath();
+        ctx.arc(119, 300, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
       }
-    }
-
-    const player = state.player;
-    // Blink while invulnerable after a hit: hidden on every other tenth of a second.
-    if (player.invulnerable === 0 || Math.floor(player.invulnerable * 10) % 2 === 1) {
-      context.fillStyle = PALETTE.player;
-      context.fillRect(player.x, player.y, player.width, player.height);
-    }
-  }
-
-  function drawHud(state) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 24, 20, 28, PALETTE.text, 'left');
-    text(levelLabel(state.level), FIELD.width / 2, 20, 28, PALETTE.text, 'center');
-    const firstLife = FIELD.width - 24 - LIVES * (LIFE_SIZE + LIFE_GAP) + LIFE_GAP;
-    text('Lives', firstLife - 12, 20, 28, PALETTE.text, 'right');
-    for (let life = 0; life < LIVES; life += 1) {
-      context.fillStyle = life < state.lives ? PALETTE.player : PALETTE.ground;
-      context.fillRect(firstLife + life * (LIFE_SIZE + LIFE_GAP), 24, LIFE_SIZE, LIFE_SIZE);
-    }
-  }
-
-  function drawPanel(title, lines, prompt) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 48, PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 22, PALETTE.muted, 'center');
-    }
-    text(prompt, FIELD.width / 2, y + height - 40, 24, PALETTE.coin, 'center');
-  }
-
-  const TITLE_LINES = ['Dodge the red blocks. Catch the gold coins.', 'Move with ← → or A D.  Pause with P.', ''];
-  const PAUSED_LINES = ['The blocks will wait for you.'];
-  const OVER_LINES = ['', ''];
-
-  /** Paint one frame: the field, then the HUD or a panel for the screen the game is on. */
-  function draw(state, screen, best) {
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawField(state);
-    if (screen === SCREEN_TITLE) {
-      TITLE_LINES[2] = bestLabel(best);
-      drawPanel('Block Dodger', TITLE_LINES, 'Press Space or click to start');
-      return;
-    }
-    drawHud(state);
-    if (screen === SCREEN_PAUSED) drawPanel('Paused', PAUSED_LINES, 'Press P to resume');
-    else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      drawPanel('Game over', OVER_LINES, 'Press Space or click to play again');
-    }
-  }
-
-  resize();
-  window.addEventListener('resize', resize);
-  return { draw };
+    },
+  };
 }

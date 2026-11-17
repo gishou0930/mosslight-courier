@@ -1,124 +1,149 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+import { FLIGHT_SECONDS, HEIGHT, MOON_BLOOM, PLAYER_START, POLLEN_GOAL, WIDTH } from './config.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+const pollenPlaces = [
+  [228, 142], [328, 300], [427, 468], [515, 170],
+  [594, 364], [674, 126], [735, 476], [793, 262],
+];
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
+const thornPaths = [
+  { x: 365, y: 166, rx: 78, ry: 42, phase: .2, speed: 1.18, radius: 22 },
+  { x: 544, y: 429, rx: 88, ry: 40, phase: 2.6, speed: -1.05, radius: 24 },
+  { x: 716, y: 214, rx: 42, ry: 88, phase: 4.1, speed: 1.23, radius: 21 },
+];
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+export function createWorld() {
+  return {
+    elapsed: 0,
+    timeLeft: FLIGHT_SECONDS,
+    score: 0,
+    pollenCount: 0,
+    health: 3,
+    chain: 0,
+    chainTimer: 0,
+    mode: 'ready',
+    player: {
+      x: PLAYER_START.x, y: PLAYER_START.y, vx: 0, vy: 0,
+      facing: 0, dashTimer: 0, dashCooldown: 0, invulnerable: 0,
+      trail: [],
+    },
+    pollen: pollenPlaces.map(([x, y], index) => ({ x, y, index, taken: false })),
+    thorns: thornPaths.map((thorn, index) => ({ ...thorn, index, angle: thorn.phase, px: thorn.x, py: thorn.y })),
+    motes: [],
+  };
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+function burst(world, x, y, color, count = 10) {
+  for (let index = 0; index < count; index += 1) {
+    const angle = (Math.PI * 2 * index) / count + world.elapsed * .8;
+    const speed = 42 + (index % 4) * 17;
+    world.motes.push({
+      x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+      life: .48 + (index % 3) * .12, maxLife: .6, color,
+    });
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+}
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
-  }
+export function stepWorld(world, controls, dt) {
+  if (world.mode !== 'playing') return [];
+  const events = [];
+  const player = world.player;
+  world.elapsed += dt;
+  world.timeLeft = Math.max(0, world.timeLeft - dt);
+  world.chainTimer = Math.max(0, world.chainTimer - dt);
+  if (world.chainTimer === 0) world.chain = 0;
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
-  }
-
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  for (const thorn of world.thorns) {
+    thorn.angle += thorn.speed * dt;
+    thorn.px = thorn.x + Math.cos(thorn.angle) * thorn.rx;
+    thorn.py = thorn.y + Math.sin(thorn.angle * .86) * thorn.ry;
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
+  player.dashCooldown = Math.max(0, player.dashCooldown - dt);
+  player.dashTimer = Math.max(0, player.dashTimer - dt);
+  player.invulnerable = Math.max(0, player.invulnerable - dt);
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
+  const inputLength = Math.hypot(controls.x, controls.y);
+  if (inputLength > .01) player.facing = Math.atan2(controls.y, controls.x);
 
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
+  if (controls.dashPressed && player.dashCooldown === 0) {
+    let dashX = controls.x;
+    let dashY = controls.y;
+    if (Math.hypot(dashX, dashY) < .01) {
+      dashX = Math.cos(player.facing);
+      dashY = Math.sin(player.facing);
     }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
+    player.vx = dashX * 560;
+    player.vy = dashY * 560;
+    player.dashTimer = .2;
+    player.dashCooldown = 2.15;
+    burst(world, player.x, player.y, '#c4f2a0', 8);
+    events.push({ type: 'dash' });
+  }
 
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
+  if (player.dashTimer <= 0) {
+    player.vx += controls.x * 690 * dt;
+    player.vy += controls.y * 690 * dt;
+    const drag = Math.exp(-4.5 * dt);
+    player.vx *= drag;
+    player.vy *= drag;
+    const speed = Math.hypot(player.vx, player.vy);
+    const maxSpeed = 248;
+    if (speed > maxSpeed) {
+      player.vx = (player.vx / speed) * maxSpeed;
+      player.vy = (player.vy / speed) * maxSpeed;
+    }
+  }
+
+  player.x = Math.max(26, Math.min(WIDTH - 26, player.x + player.vx * dt));
+  player.y = Math.max(42, Math.min(HEIGHT - 31, player.y + player.vy * dt));
+  player.trail.unshift({ x: player.x, y: player.y });
+  if (player.trail.length > 16) player.trail.pop();
+
+  if (player.invulnerable === 0 && player.dashTimer === 0) {
+    for (const thorn of world.thorns) {
+      if (Math.hypot(player.x - thorn.px, player.y - thorn.py) < thorn.radius + 13) {
+        world.health -= 1;
+        world.score = Math.max(0, world.score - 50);
+        player.invulnerable = 1.2;
+        const angle = Math.atan2(player.y - thorn.py, player.x - thorn.px);
+        player.vx = Math.cos(angle) * 190;
+        player.vy = Math.sin(angle) * 190;
+        burst(world, player.x, player.y, '#ff9d9d', 12);
+        events.push({ type: 'hurt', health: world.health });
+        break;
       }
     }
-    return events;
   }
 
-  reset();
-  return { state, reset, step };
+  for (const bloom of world.pollen) {
+    if (bloom.taken || Math.hypot(player.x - bloom.x, player.y - bloom.y) > 23) continue;
+    bloom.taken = true;
+    world.pollenCount += 1;
+    world.chain += 1;
+    world.chainTimer = 3.2;
+    const gained = 100 + Math.max(0, world.chain - 1) * 25;
+    world.score += gained;
+    burst(world, bloom.x, bloom.y, '#ffe7a3', 11);
+    events.push({ type: 'pollen', count: world.pollenCount, gained, chain: world.chain });
+  }
+
+  for (const mote of world.motes) {
+    mote.x += mote.vx * dt;
+    mote.y += mote.vy * dt;
+    mote.vx *= Math.exp(-2.2 * dt);
+    mote.vy *= Math.exp(-2.2 * dt);
+    mote.life -= dt;
+  }
+  world.motes = world.motes.filter((mote) => mote.life > 0);
+
+  if (world.health <= 0 || world.timeLeft <= 0) {
+    world.mode = 'lost';
+    events.push({ type: 'lost' });
+  } else if (world.pollenCount >= POLLEN_GOAL && Math.hypot(player.x - MOON_BLOOM.x, player.y - MOON_BLOOM.y) < 47) {
+    world.mode = 'won';
+    world.score += Math.ceil(world.timeLeft) * 12;
+    burst(world, MOON_BLOOM.x, MOON_BLOOM.y, '#fbe4a0', 28);
+    events.push({ type: 'won' });
+  }
+  return events;
 }
